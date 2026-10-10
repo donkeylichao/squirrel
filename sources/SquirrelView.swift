@@ -7,6 +7,20 @@
 
 import AppKit
 
+private final class SquirrelTextView: NSTextView {
+  var allowsWindowDrag = false
+
+  override var mouseDownCanMoveWindow: Bool {
+    guard allowsWindowDrag, let event = NSApp.currentEvent, let index = characterIndex(for: event) else { return false }
+    return attributedString().attribute(.windowDrag, at: index, effectiveRange: nil) as? Bool == true
+  }
+
+  private func characterIndex(for event: NSEvent) -> Int? {
+    let index = characterIndexForInsertion(at: convert(event.locationInWindow, from: nil))
+    return index < attributedString().length ? index : nil
+  }
+}
+
 private class SquirrelLayoutDelegate: NSObject, NSTextLayoutManagerDelegate {
   func textLayoutManager(_ textLayoutManager: NSTextLayoutManager, shouldBreakLineBefore location: any NSTextLocation, hyphenating: Bool) -> Bool {
     let index = textLayoutManager.offset(from: textLayoutManager.documentRange.location, to: location)
@@ -20,10 +34,12 @@ private class SquirrelLayoutDelegate: NSObject, NSTextLayoutManagerDelegate {
 
 extension NSAttributedString.Key {
   static let noBreak = NSAttributedString.Key("noBreak")
+  static let windowDrag = NSAttributedString.Key("windowDrag")
 }
 
 final class SquirrelView: NSView {
   let textView: NSTextView
+  private var allowsWindowDrag = false
 
   private let squirrelLayoutDelegate: SquirrelLayoutDelegate
   var candidateRanges: [NSRange] = []
@@ -52,9 +68,18 @@ final class SquirrelView: NSView {
     textLayoutManager.textContainer!
   }
 
+  func setWindowDraggingEnabled(_ enabled: Bool) {
+    allowsWindowDrag = enabled
+    (textView as? SquirrelTextView)?.allowsWindowDrag = enabled
+    textView.isSelectable = enabled
+    if !enabled {
+      textView.setSelectedRange(.empty)
+    }
+  }
+
   override init(frame frameRect: NSRect) {
     squirrelLayoutDelegate = SquirrelLayoutDelegate()
-    textView = NSTextView(frame: frameRect)
+    textView = SquirrelTextView(frame: frameRect)
     textView.drawsBackground = false
     textView.isEditable = false
     textView.isSelectable = false
@@ -70,6 +95,9 @@ final class SquirrelView: NSView {
 
   override var isFlipped: Bool {
     true
+  }
+  override var mouseDownCanMoveWindow: Bool {
+    allowsWindowDrag
   }
   var isDark: Bool {
     NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua

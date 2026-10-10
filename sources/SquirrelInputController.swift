@@ -27,6 +27,10 @@ final class SquirrelInputController: IMKInputController {
   private var chordTimer: Timer?
   private var chordDuration: TimeInterval = 0
   private var currentApp: String = ""
+  private var translationBuffer = ""
+  private var translationTimer: Timer?
+  private var translationDataTask: URLSessionDataTask?
+  private var translationRequestID = UUID()
 
   // swiftlint:disable:next cyclomatic_complexity
   override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
@@ -97,6 +101,7 @@ final class SquirrelInputController: IMKInputController {
       if modifiers.contains(.command) {
         break
       }
+      NSApp.squirrelAppDelegate.panel?.hideTranslation()
 
       let keyCode = event.keyCode
       var keyChars = event.charactersIgnoringModifiers
@@ -112,7 +117,19 @@ final class SquirrelInputController: IMKInputController {
         if rimeKeycode != 0 {
           let rimeModifiers = SquirrelKeycode.osxModifiersToRime(modifiers: modifiers)
           handled = processKey(rimeKeycode, modifiers: rimeModifiers)
+          let deletesCommittedText = rimeKeycode == XK_BackSpace && !handled && preedit.isEmpty
+          var insertsDirectText = false
+          if deletesCommittedText {
+            translationBuffer = String(translationBuffer.dropLast())
+          } else if !handled, preedit.isEmpty, let text = event.characters, Self.isVisibleText(text) {
+            translationBuffer += text
+            insertsDirectText = true
+          }
+          cancelTranslationWork(clearBuffer: rimeKeycode == XK_Escape)
           rimeUpdate()
+          if insertsDirectText, translationBuffer.range(of: "\\p{Han}", options: .regularExpression) != nil {
+            scheduleTranslation(for: "")
+          }
         }
       }
 
@@ -219,6 +236,7 @@ final class SquirrelInputController: IMKInputController {
   }
 
   override func deactivateServer(_ sender: Any!) {
+    cancelTranslationWork(clearBuffer: true)
     hidePalettes()
     commitComposition(sender)
     client = nil
@@ -306,6 +324,7 @@ final class SquirrelInputController: IMKInputController {
   }
 
   deinit {
+    cancelTranslationWork(clearBuffer: true)
     destroySession()
   }
 }
@@ -438,7 +457,9 @@ private extension SquirrelInputController {
     var commitText = RimeCommit.rimeStructInit()
     if rimeAPI.get_commit(session, &commitText) {
       if let text = commitText.text {
-        commit(string: String(cString: text))
+        let string = String(cString: text)
+        commit(string: string)
+        scheduleTranslation(for: string)
       }
       _ = rimeAPI.free_commit(&commitText)
     }
@@ -618,6 +639,164 @@ private extension SquirrelInputController {
     }
   }
 
+  func scheduleTranslation(for committedText: String) {
+    guard NSApp.squirrelAppDelegate.config?.getBool("translation/enabled") == true else { return }
+    guard !translationBuffer.isEmpty || committedText.range(of: "\\p{Han}", options: .regularExpression) != nil else { return }
+
+    #if DEBUG
+    _ = Self.translationDecoderSelfCheck
+    #endif
+
+    translationBuffer += committedText
+    cancelTranslationWork(clearBuffer: false)
+
+    let source = translationBuffer
+    let requestID = UUID()
+    translationRequestID = requestID
+    let sentenceEndings = CharacterSet(charactersIn: "。！？!?.")
+    let delay = source.unicodeScalars.last.map(sentenceEndings.contains) == true ? 0.05 : 0.8
+
+    translationTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+      self?.requestTranslationFromClient(fallbackSource: source, requestID: requestID)
+    }
+  }
+
+  func cancelTranslationWork(clearBuffer: Bool) {
+    translationTimer?.invalidate()
+    translationTimer = nil
+    translationDataTask?.cancel()
+    translationDataTask = nil
+    translationRequestID = UUID()
+    if clearBuffer {
+      translationBuffer = ""
+    }
+  }
+
+  func requestTranslationFromClient(fallbackSource: String, requestID: UUID) {
+    guard translationRequestID == requestID else { return }
+
+    let source = currentClientText() ?? fallbackSource
+
+    guard source.range(of: "\\p{Han}", options: .regularExpression) != nil else {
+      cancelTranslationWork(clearBuffer: true)
+      return
+    }
+    translationBuffer = source
+    requestTranslation(source: source, requestID: requestID)
+  }
+
+  func currentClientText() -> String? {
+    guard let client else { return nil }
+    let documentLength = client.length()
+    guard documentLength != NSNotFound,
+          let text = client.attributedSubstring(from: NSRange(location: 0, length: documentLength)),
+          text.length == documentLength else { return nil }
+    return text.string
+  }
+
+  func requestTranslation(source: String, requestID: UUID) {
+    let model = NSApp.squirrelAppDelegate.config?.getString("translation/model") ?? "qwen3.5:4b"
+    var request = URLRequest(url: URL(string: "http://localhost:11434/api/chat")!)
+    request.httpMethod = "POST"
+    request.timeoutInterval = 15
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: [
+      "model": model,
+      "messages": [
+        [
+          "role": "system",
+          "content": "Translate Simplified Chinese into English. Return direct and natural. Direct is accurate and concise; natural is idiomatic everyday English. Do not explain."
+        ],
+        ["role": "user", "content": source]
+      ],
+      "format": [
+        "type": "object",
+        "properties": [
+          "direct": ["type": "string"],
+          "natural": ["type": "string"]
+        ],
+        "required": ["direct", "natural"]
+      ],
+      "think": false,
+      "stream": false,
+      "keep_alive": "30m",
+      "options": ["temperature": 0.2, "num_predict": 200]
+    ])
+
+    guard request.httpBody != nil else { return }
+    translationDataTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+      if (error as? URLError)?.code == .cancelled { return }
+
+      do {
+        if let error { throw error }
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200..<300).contains(httpResponse.statusCode),
+              let data else {
+          throw TranslationError.invalidResponse
+        }
+        let result = try Self.decodeTranslation(data)
+        DispatchQueue.main.async {
+          self?.finishTranslation(result, source: source, requestID: requestID)
+        }
+      } catch {
+        DispatchQueue.main.async {
+          self?.failTranslation(error, source: source, requestID: requestID)
+        }
+      }
+    }
+    translationDataTask?.resume()
+  }
+
+  static func decodeTranslation(_ data: Data) throws -> TranslationResult {
+    let response = try JSONDecoder().decode(OllamaChatResponse.self, from: data)
+    guard let content = response.message.content.data(using: .utf8) else {
+      throw TranslationError.invalidResponse
+    }
+    let result = try JSONDecoder().decode(TranslationResult.self, from: content)
+    guard !result.direct.isEmpty, !result.natural.isEmpty else {
+      throw TranslationError.invalidResponse
+    }
+    return result
+  }
+
+  static func isVisibleText(_ text: String) -> Bool {
+    !text.isEmpty && text.unicodeScalars.allSatisfy { scalar in
+      scalar.value >= 0x20 && scalar.value != 0x7f && !(0xf700...0xf8ff).contains(scalar.value)
+    }
+  }
+
+  #if DEBUG
+  static let translationDecoderSelfCheck: Void = {
+    let sample = #"{"message":{"content":"{\"direct\":\"Hello.\",\"natural\":\"Hi.\"}"}}"#
+    let result = try? decodeTranslation(Data(sample.utf8))
+    assert(result?.direct == "Hello." && result?.natural == "Hi.")
+    assert(isVisibleText("2026") && !isVisibleText("\t") && !isVisibleText("\u{f700}"))
+  }()
+  #endif
+
+  func finishTranslation(_ result: TranslationResult, source: String, requestID: UUID) {
+    guard translationRequestID == requestID, translationBuffer == source, preedit.isEmpty, let client else { return }
+    translationDataTask = nil
+    if let currentText = currentClientText(), currentText != source {
+      translationBuffer = currentText
+      scheduleTranslation(for: "")
+      return
+    }
+
+    var inputPosition = NSRect()
+    client.attributes(forCharacterIndex: 0, lineHeightRectangle: &inputPosition)
+    if let panel = NSApp.squirrelAppDelegate.panel {
+      panel.position = inputPosition
+      panel.inputController = self
+      panel.showTranslation(source: source, direct: result.direct, natural: result.natural)
+    }
+  }
+
+  func failTranslation(_: Error, source: String, requestID: UUID) {
+    guard translationRequestID == requestID, translationBuffer == source, preedit.isEmpty else { return }
+    translationDataTask = nil
+  }
+
   private func handleASCIIModeToggle(_ notification: Notification) {
     guard let enableASCII = notification.object as? Bool else { return }
     guard session != 0 && rimeAPI.find_session(session) else { return }
@@ -639,4 +818,21 @@ private extension SquirrelInputController {
     )
   }
 
+}
+
+private struct OllamaChatResponse: Decodable {
+  struct Message: Decodable {
+    let content: String
+  }
+
+  let message: Message
+}
+
+private struct TranslationResult: Decodable {
+  let direct: String
+  let natural: String
+}
+
+private enum TranslationError: Error {
+  case invalidResponse
 }

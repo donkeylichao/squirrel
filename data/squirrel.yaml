@@ -1,7 +1,7 @@
 # Squirrel settings
 # encoding: utf-8
 
-config_version: '1.0'
+config_version: '1.1'
 
 # options: last | default | _custom_
 # last: the last used latin keyboard layout
@@ -23,6 +23,11 @@ show_notifications_when: appropriate
 # Falls back to "中" / "Ａ" when no `states:` is defined.
 status_icon:
   show: true
+
+# Local Chinese-to-English suggestions powered by Ollama.
+translation:
+  enabled: true
+  model: qwen3.5:4b
 
 style:
   color_scheme: native

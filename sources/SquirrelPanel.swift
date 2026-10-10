@@ -18,6 +18,9 @@ final class SquirrelPanel: NSPanel {
 
   private var statusMessage: String = ""
   private var statusTimer: Timer?
+  private var showingTranslation = false
+  private var translationCopyButtons: [NSButton] = []
+  private var translationCopyTexts: [String] = []
 
   private var preedit: String = ""
   private var selRange: NSRange = .empty
@@ -40,6 +43,7 @@ final class SquirrelPanel: NSPanel {
     super.init(contentRect: position, styleMask: .nonactivatingPanel, backing: .buffered, defer: true)
     self.level = .init(Int(CGShieldingWindowLevel()))
     self.hasShadow = true
+    self.isMovableByWindowBackground = true
     self.isOpaque = false
     self.backgroundColor = .clear
     back.wantsLayer = true
@@ -49,6 +53,20 @@ final class SquirrelPanel: NSPanel {
     contentView.addSubview(view)
     contentView.addSubview(view.textView)
     self.contentView = contentView
+    for index in 0..<3 {
+      let button = NSButton()
+      button.tag = index
+      button.target = self
+      button.action = #selector(copyTranslationSection(_:))
+      button.isBordered = false
+      button.imagePosition = .imageOnly
+      button.imageScaling = .scaleProportionallyDown
+      button.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "复制")
+      button.toolTip = "复制"
+      button.isHidden = true
+      contentView.addSubview(button)
+      translationCopyButtons.append(button)
+    }
   }
 
   var linear: Bool {
@@ -145,12 +163,18 @@ final class SquirrelPanel: NSPanel {
   func hide() {
     statusTimer?.invalidate()
     statusTimer = nil
+    showingTranslation = false
+    translationCopyButtons.forEach { $0.isHidden = true }
+    view.setWindowDraggingEnabled(false)
     orderOut(nil)
     maxHeight = 0
   }
 
   // swiftlint:disable:next cyclomatic_complexity function_parameter_count
   func update(preedit: String, selRange: NSRange, caretPos: Int, candidates: [String], comments: [String], labels: [String], highlighted index: Int, page: Int, lastPage: Bool, update: Bool) {
+    showingTranslation = false
+    translationCopyButtons.forEach { $0.isHidden = true }
+    view.setWindowDraggingEnabled(false)
     if update {
       self.preedit = preedit
       self.selRange = selRange
@@ -316,6 +340,92 @@ final class SquirrelPanel: NSPanel {
     }
   }
 
+  func showTranslation(source: String, direct: String, natural: String) {
+    statusTimer?.invalidate()
+    statusTimer = nil
+    statusMessage = ""
+    preedit = ""
+    candidates = []
+    comments = []
+    labels = []
+    showingTranslation = true
+    view.setWindowDraggingEnabled(true)
+
+    let theme = view.currentTheme
+    let text = NSMutableAttributedString()
+    var headingAttrs = theme.commentAttrs
+    let headingFont = theme.commentFont.withSize(max(11, theme.commentFont.pointSize - 3))
+    headingAttrs[.font] = NSFontManager.shared.convert(headingFont, toHaveTrait: .boldFontMask)
+    headingAttrs[.baselineOffset] = theme.baseOffset
+    headingAttrs[.windowDrag] = true
+    let headingStyle = theme.paragraphStyle.mutableCopy() as! NSMutableParagraphStyle
+    headingStyle.paragraphSpacing = 3
+    headingAttrs[.paragraphStyle] = headingStyle
+    var bodyAttrs = theme.attrs
+    bodyAttrs[.font] = theme.font.withSize(max(12, theme.font.pointSize - 2))
+    bodyAttrs[.baselineOffset] = theme.baseOffset
+    let bodyStyle = theme.paragraphStyle.mutableCopy() as! NSMutableParagraphStyle
+    bodyStyle.lineSpacing = 2
+    bodyStyle.paragraphSpacing = 12
+    bodyAttrs[.paragraphStyle] = bodyStyle
+    var sourceAttrs = theme.commentAttrs
+    sourceAttrs[.font] = theme.commentFont.withSize(max(12, theme.commentFont.pointSize - 2))
+    sourceAttrs[.baselineOffset] = theme.baseOffset
+    sourceAttrs[.paragraphStyle] = bodyStyle
+    let sections: [(String, String, [NSAttributedString.Key: Any])] = [
+      ("中文原文", source, sourceAttrs),
+      ("英文表达", direct, bodyAttrs),
+      ("自然说法", natural, bodyAttrs)
+    ]
+    translationCopyTexts = sections.map(\.1)
+    var headingRanges: [NSRange] = []
+    for (index, section) in sections.enumerated() {
+      if index > 0 {
+        text.append(NSAttributedString(string: "\n", attributes: bodyAttrs))
+      }
+      headingRanges.append(NSRange(location: text.length, length: section.0.utf16.count))
+      text.append(NSAttributedString(string: "\(section.0)\u{2003}\u{2003}", attributes: headingAttrs))
+      text.append(NSAttributedString(string: "\n", attributes: headingAttrs))
+      text.append(NSAttributedString(string: section.1, attributes: section.2))
+    }
+
+    view.textContentStorage.attributedString = text
+    view.textView.setLayoutOrientation(vertical ? .vertical : .horizontal)
+    view.drawView(candidateRanges: [NSRange(location: 0, length: text.length)], hilightedIndex: -1,
+                  preeditRange: .empty, highlightedPreeditRange: .empty, canPageUp: false, canPageDown: false)
+    show(textWidthLimit: vertical ? nil : 360, preferAbove: true)
+    for (button, range) in zip(translationCopyButtons, headingRanges) {
+      guard let textRange = view.convert(range: range) else { continue }
+      let headingRect = view.contentRect(range: textRange)
+      let inset = view.textView.textContainerInset
+      let buttonRect = NSRect(x: inset.width + headingRect.maxX + 4,
+                              y: inset.height + headingRect.midY - 8,
+                              width: 16, height: 16)
+      button.frame = view.textView.convert(buttonRect, to: contentView)
+      button.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "复制")
+      button.isHidden = false
+    }
+
+    statusTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: false) { [weak self] _ in
+      self?.hide()
+    }
+  }
+
+  func hideTranslation() {
+    if showingTranslation {
+      hide()
+    }
+  }
+
+  @objc private func copyTranslationSection(_ sender: NSButton) {
+    guard translationCopyTexts.indices.contains(sender.tag) else { return }
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    if pasteboard.setString(translationCopyTexts[sender.tag], forType: .string) {
+      sender.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "已复制")
+    }
+  }
+
   func load(config: SquirrelConfig, forDarkMode isDark: Bool) {
     if isDark {
       view.darkTheme = SquirrelTheme()
@@ -358,7 +468,7 @@ private extension SquirrelPanel {
   }
 
   // swiftlint:disable:next cyclomatic_complexity
-  func show() {
+  func show(textWidthLimit: CGFloat? = nil, preferAbove: Bool = false) {
     currentScreen()
     let theme = view.currentTheme
     if theme.native || view.darkTheme.available {
@@ -370,7 +480,7 @@ private extension SquirrelPanel {
 
     view.textView.textContainerInset = theme.edgeInset
 
-    var textWidth = maxTextWidth()
+    var textWidth = min(maxTextWidth(), textWidthLimit ?? .greatestFiniteMagnitude)
     // Measure natural text height before constraining the panel.
     view.textContainer.size = NSSize(width: textWidth, height: .greatestFiniteMagnitude)
 
@@ -474,7 +584,10 @@ private extension SquirrelPanel {
           panelRect.origin.x += preeditRect.height + theme.edgeInset.width
         }
       } else {
-        panelRect.origin = NSPoint(x: position.minX - theme.pagingOffset, y: position.minY - SquirrelTheme.offsetHeight - panelRect.height)
+        let below = position.minY - SquirrelTheme.offsetHeight - panelRect.height
+        let above = position.maxY + SquirrelTheme.offsetHeight
+        let y = preferAbove && above + panelRect.height <= screenRect.maxY ? above : below
+        panelRect.origin = NSPoint(x: position.minX - theme.pagingOffset, y: y)
       }
 
       if panelRect.maxX > screenRect.maxX { panelRect.origin.x = screenRect.maxX - panelRect.width }
